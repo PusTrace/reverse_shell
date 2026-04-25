@@ -1,8 +1,8 @@
 
-all: server client
+all: client
 
-server:
-	gcc server.c -o server
+s:
+	python server.py
 
 client:
 	gcc client.c -o client
